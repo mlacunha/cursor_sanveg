@@ -1,0 +1,44 @@
+# Segredos e ambiente local
+.env
+.env.*
+!.env.example
+**/.env
+**/.env.*
+!**/.env.example
+.env (1)
+**/.env (1)
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+*.egg-info/
+
+# Node / Nuxt
+node_modules/
+.nuxt/
+.output/
+.nitro/
+.cache/
+dist/
+
+# Cópia antiga da API e pacotes grandes (o zip contém credencial)
+downloads/*.zip
+downloads/*.sql
+downloads/*.xlsx
+
+# Artefatos locais da API
+backend/temp_maps/
+backend/temp_pdfs/
+backend/uploads/
+backend/car/
+
+# Ferramentas locais
+.antigravitycli/
+
+# Sistema
+.DS_Store
+Thumbs.db
+*.log

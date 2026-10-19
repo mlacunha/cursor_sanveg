@@ -1,0 +1,597 @@
+"""
+PDF Service - Geração profissional de PDFs padrão GIS/Engenharia
+Utiliza Playwright para captura de mapas e FPDF2 para montagem do documento.
+
+IMPORTANTE: Os dados técnicos (coordenadas, totais, etc) são extraídos DIRETAMENTE
+do banco de dados para garantir fé pública, não apenas do screenshot visual.
+
+ARQUITETURA ASYNC CORRETA:
+- Playwright: async com async_playwright() context manager
+- FPDF2: síncrono executado via run_in_executor
+- SEM asyncio.run() ou asyncio.new_event_loop() - FastAPI gerencia o event loop
+"""
+
+import os
+import asyncio
+import logging
+import traceback
+from datetime import datetime
+from typing import Optional, Dict, Any
+from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor
+
+logger = logging.getLogger(__name__)
+class PDFMapService:
+    """Serviço para geração de PDFs de mapas em padrão GIS/Engenharia."""
+    
+    def __init__(self, output_dir: str = "temp_maps", base_url: Optional[str] = None, debug_mode: bool = False):
+        """
+        Inicializa o serviço de PDF para ambiente Linux/Ubuntu.
+        
+        Args:
+            output_dir: Diretório onde os PDFs serão salvos (usa pathlib.Path)
+            base_url: URL base da aplicação (ex: http://127.0.0.1:8000)
+            debug_mode: Se True, abre navegador visível para debug (força False em produção)
+        """
+        # 🐧 PATHLIB: Compatibilidade total com Linux
+        self.output_dir = Path(output_dir).resolve()
+        
+        # 🔒 PERMISSÕES: Criar diretório com permissões corretas (0o755)
+        self.output_dir.mkdir(parents=True, exist_ok=True, mode=0o755)
+        
+        # ThreadPoolExecutor para tarefas síncronas (FPDF)
+        self.executor = ThreadPoolExecutor(max_workers=2)
+        
+        # 🌐 BASE URL: Prioridade para 127.0.0.1 (mais confiável que localhost em alguns servidores)
+        if base_url:
+            self.base_url = base_url.rstrip('/')
+        else:
+            # Fallback: 127.0.0.1:8000 (porta padrão Uvicorn)
+            self.base_url = os.getenv('BASE_URL', 'http://127.0.0.1:8000').rstrip('/')
+        
+        # 🖥️ HEADLESS MODE: Forçar False apenas em desenvolvimento local explícito
+        # Em produção/servidor Ubuntu, sempre headless=True
+        self.debug_mode = debug_mode and os.getenv('PDF_DEBUG', 'false').lower() == 'true'
+        
+        logger.info(f"PDFMapService inicializado (Ubuntu/Linux):")
+        logger.info(f"  - base_url: {self.base_url}")
+        logger.info(f"  - output_dir: {self.output_dir} (pathlib)")
+        logger.info(f"  - debug_mode: {self.debug_mode} {'(NAVEGADOR VISÍVEL)' if self.debug_mode else '(headless=True)'}")
+        logger.info(f"  - permissions: 0o755 (rwxr-xr-x)")
+        logger.warning("")
+        logger.warning("⚠️  IMPORTANTE: Para evitar DEADLOCK entre captura PDF e servidor:")
+        logger.warning("   Inicie o Uvicorn com múltiplos workers:")
+        logger.warning("   → uvicorn main:app --reload --host 0.0.0.0 --port 8000 --workers 4")
+        logger.warning("   (Isso permite processar PDF + Visualização HTML simultaneamente)")
+        logger.warning("")
+        
+    async def capture_map_screenshot(
+        self,
+        map_url: str,
+        wait_selector: str = ".leaflet-container",
+        timeout: int = 60000,
+        width: int = 1615,
+        height: int = 1000
+    ) -> bytes:
+        """
+        Captura screenshot do mapa usando Playwright 1.57.0 em ambiente Ubuntu/Linux.
+        
+        OTIMIZAÇÕES REFATORADAS (Dezembro 2025):
+        - Navegação DIRETA para URL da visualização HTML (não arquivo local)
+        - Screenshot de debug automático em caso de falha
+        - Logs detalhados da URL acessada
+        - Viewport 1615x1000 (proporção 1.615:1) SINCRONIZADA com PDF 210x130mm
+        - Resiliência: captura página inteira se seletor falhar
+        
+        Args:
+            map_url: URL completa da visualização HTML (ex: http://127.0.0.1:8000/api/relatorio-mapa/visualizar?...)
+            wait_selector: Seletor CSS para aguardar carregamento (.leaflet-container)
+            timeout: Timeout em milissegundos (60000 = 60s)
+            width: Largura da viewport (1615px - proporção 1.615:1)
+            height: Altura da viewport (1000px - proporção 1.615:1)
+            
+        Returns:
+            bytes: Screenshot em formato PNG
+            
+        Raises:
+            Exception: Falha na captura com traceback completo e screenshot de debug
+        """
+        from playwright.async_api import async_playwright
+        
+        browser = None
+        context = None
+        
+        try:
+            logger.info("=" * 80)
+            logger.info("🚀 INICIANDO CAPTURA DE SCREENSHOT (Playwright 1.57.0 - Ubuntu)")
+            logger.info("=" * 80)
+            
+            # 🔗 LOG DETALHADO DA URL
+            logger.info(f"🌐 URL DA VISUALIZAÇÃO HTML:")
+            logger.info(f"   {map_url}")
+            logger.info(f"")
+            logger.info(f"🎯 Configurações:")
+            logger.info(f"   - Seletor aguardado: {wait_selector}")
+            logger.info(f"   - Timeout: {timeout}ms ({timeout/1000}s)")
+            logger.info(f"   - Viewport: {width}x{height} (proporção 1.615:1 - PDF 210x130mm)")
+            logger.info(f"   - Headless: {not self.debug_mode}")
+            logger.info("=" * 80)
+            
+            # PLAYWRIGHT: Context manager async
+            async with async_playwright() as p:
+                logger.info("✓ Playwright inicializado")
+                
+                # 🐧 UBUNTU/LINUX: headless=True (servidor/produção)
+                browser = await p.chromium.launch(
+                    headless=not self.debug_mode,
+                    args=[
+                        '--no-sandbox',
+                        '--disable-setuid-sandbox',
+                        '--disable-dev-shm-usage',
+                        '--disable-gpu',
+                        '--disable-software-rasterizer',
+                        '--disable-extensions',
+                        '--disable-background-networking',
+                        '--disable-sync',
+                        '--no-first-run',
+                        '--disable-features=TranslateUI',
+                    ]
+                )
+                logger.info(f"✓ Chromium lançado (headless={not self.debug_mode})")
+                
+                # Context com viewport e scale
+                context = await browser.new_context(
+                    viewport={'width': width, 'height': height},
+                    device_scale_factor=2,  # 2x para qualidade de screenshot
+                    locale='pt-BR',
+                    timezone_id='America/Sao_Paulo'
+                )
+                logger.info(f"✓ Context criado: {width}x{height} @ 2x scale")
+                
+                page = await context.new_page()
+                logger.info("✓ Nova página criada")
+                
+                # 🌐 NAVEGAÇÃO: URL direta da visualização HTML
+                logger.info(f"🌐 Navegando para URL da visualização...")
+                logger.info(f"   → {map_url}")
+                logger.info(f"   (wait_until='load', timeout={timeout}ms)")
+                
+                # 🐧 OTIMIZAÇÃO UBUNTU: wait_until='load' é mais confiável que 'networkidle'
+                # networkidle pode falhar em servidores com recursos limitados
+                await page.goto(map_url, wait_until='load', timeout=timeout)
+                logger.info("✓ Página carregada (DOM load event)")
+                
+                # ⏳ AGUARDAR SELETOR com resiliência
+                logger.info(f"🔍 Aguardando seletor '{wait_selector}'...")
+                
+                try:
+                    # 🐧 UBUNTU: 20s é suficiente para Leaflet renderizar
+                    await page.wait_for_selector(wait_selector, timeout=20000)  # 20s
+                    logger.info(f"✓ Seletor '{wait_selector}' encontrado")
+                    
+                    # Verificar elemento existe
+                    map_element = await page.query_selector(wait_selector)
+                    if not map_element:
+                        raise Exception(
+                            f"Seletor '{wait_selector}' não encontrado após wait_for_selector. "
+                            f"Página pode estar retornando erro 500 ou HTML inválido."
+                        )
+                    
+                    logger.info("✓ Elemento do mapa confirmado na DOM")
+                    
+                except Exception as selector_error:
+                    # 🚨 SCREENSHOT DE DEBUG: Capturar página inteira para diagnóstico
+                    logger.error(f"⚠️ FALHA AO ENCONTRAR SELETOR: {selector_error}")
+                    logger.error("📸 Capturando screenshot de debug (full page) para análise...")
+                    
+                    # Salvar em temp_maps/ com timestamp
+                    debug_filename = f"debug_error_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
+                    debug_screenshot_path = str(self.output_dir / debug_filename)
+                    
+                    await page.screenshot(path=debug_screenshot_path, full_page=True)
+                    
+                    logger.error(f"💾 Screenshot de debug salvo: {debug_screenshot_path}")
+                    logger.error(f"🔍 Analise este arquivo para diagnosticar:")
+                    logger.error(f"   - Erro 500 do servidor")
+                    logger.error(f"   - Problema de autenticação")
+                    logger.error(f"   - HTML inválido/incompleto")
+                    logger.error(f"   - Falha no carregamento do Leaflet")
+                    
+                    # Re-raise com contexto adicional
+                    raise Exception(
+                        f"Falha ao encontrar '{wait_selector}' na página. "
+                        f"Screenshot de debug salvo em: {debug_screenshot_path}. "
+                        f"Verifique se a URL {map_url} está retornando HTML válido com Folium/Leaflet."
+                    ) from selector_error
+                
+                # ⏳ AGUARDAR RENDERIZAÇÃO: 2s para garantir carregamento de cores e tiles
+                logger.info("⏳ Aguardando 2s para renderização completa das cores...")
+                await page.wait_for_timeout(2000)
+                logger.info("✓ Cores e tiles renderizados")
+                
+                # 📸 CAPTURA: Screenshot do elemento do mapa
+                logger.info("📸 Capturando screenshot do elemento do mapa...")
+                screenshot_bytes = await map_element.screenshot(type='png')
+                
+                size_kb = len(screenshot_bytes) / 1024
+                logger.info(f"✓ Screenshot capturado: {len(screenshot_bytes):,} bytes ({size_kb:.1f} KB)")
+                logger.info("=" * 80)
+                logger.info("✅ SCREENSHOT CAPTURADO COM SUCESSO")
+                logger.info("=" * 80)
+                
+                return screenshot_bytes
+                
+        except Exception as e:
+            error_trace = traceback.format_exc()
+            
+            logger.error("=" * 80)
+            logger.error("🚨 ERRO AO CAPTURAR SCREENSHOT")
+            logger.error("=" * 80)
+            logger.error(f"URL acessada: {map_url}")
+            logger.error(f"Tipo: {type(e).__name__}")
+            logger.error(f"Mensagem: {str(e)}")
+            logger.error(f"\nTraceback completo:\n{error_trace}")
+            logger.error("=" * 80)
+            
+            # Re-raise com mensagem descritiva
+            raise Exception(
+                f"Falha ao capturar screenshot do mapa. "
+                f"URL: {map_url} | Erro: {repr(e)}"
+            ) from e
+            
+        finally:
+            # 🧹 CLEANUP: Sempre fechar browser/context
+            if context:
+                try:
+                    await context.close()
+                    logger.info("✓ Context fechado")
+                except Exception as cleanup_err:
+                    logger.warning(f"Erro ao fechar context: {cleanup_err}")
+                    
+            if browser:
+                try:
+                    await browser.close()
+                    logger.info("✓ Browser fechado")
+                except Exception as cleanup_err:
+                    logger.warning(f"Erro ao fechar browser: {cleanup_err}")
+    
+    def _generate_pdf_sync(
+        self,
+        screenshot_path: str,
+        output_filename: str,
+        metadata: Dict[str, Any]
+    ) -> str:
+        """
+        Gera PDF no padrão GIS/Engenharia com MOLDURA PROFISSIONAL e ESCALA GRÁFICA.
+        
+        Layout:
+        - A4 Paisagem (297x210mm)
+        - Cabeçalho azul com dados do projeto
+        - Mapa centralizado com moldura dupla
+        - Carimbo técnico com dados DO BANCO
+        - Escala gráfica no canto inferior
+        - Rodapé com informações de fé pública
+        
+        Args:
+            screenshot_path: Caminho para o screenshot do mapa
+            output_filename: Nome do arquivo PDF de saída
+            metadata: Metadados REAIS do banco (coordenadas, totais, etc)
+            
+        Returns:
+            str: Caminho completo do PDF gerado
+        """
+        from fpdf import FPDF
+        
+        try:
+            logger.info("=" * 80)
+            logger.info("GERANDO PDF PADRÃO GIS/ENGENHARIA")
+            logger.info(f"Arquivo: {output_filename}")
+            logger.info(f"Dados do banco: {metadata.get('total_markers', 0)} pontos")
+            logger.info("=" * 80)
+            
+            # Criar PDF A4 Paisagem
+            pdf = FPDF(orientation='L', unit='mm', format='A4')
+            pdf.add_page()
+            pdf.set_auto_page_break(auto=False)
+            
+            # --- CABEÇALHO ---
+            pdf.set_fill_color(41, 128, 185)  # Azul profissional
+            pdf.rect(0, 0, 297, 25, 'F')
+            
+            pdf.set_text_color(255, 255, 255)
+            pdf.set_font('Arial', 'B', 16)
+            pdf.set_xy(10, 8)
+            pdf.cell(0, 10, metadata.get('title', 'Mapa GIS'), align='C')
+            
+            pdf.set_font('Arial', '', 10)
+            pdf.set_xy(10, 16)
+            pdf.cell(0, 6, f"{metadata.get('project', 'SVEGPA')} | {metadata.get('institution', 'MAPA')}", align='C')
+            
+            # Data de geração
+            pdf.set_xy(240, 8)
+            pdf.set_font('Arial', '', 9)
+            pdf.cell(50, 5, f"Gerado em: {datetime.now().strftime('%d/%m/%Y %H:%M')}", align='R')
+            
+            # --- MAPA (centralizado) ---
+            pdf.set_text_color(0, 0, 0)
+            
+            # Frame do mapa
+            map_x = 10
+            map_y = 35
+            map_width = 210
+            map_height = 130
+            
+            # --- MAPA COM MOLDURA DUPLA PROFISSIONAL ---
+            pdf.set_text_color(0, 0, 0)
+            
+            # Posições do mapa
+            map_x = 10
+            map_y = 35
+            map_width = 210
+            map_height = 130
+            
+            # MOLDURA EXTERNA (preta grossa)
+            pdf.set_draw_color(0, 0, 0)
+            pdf.set_line_width(1.0)
+            pdf.rect(map_x - 1, map_y - 1, map_width + 2, map_height + 2)
+            
+            # MOLDURA INTERNA (preta fina)
+            pdf.set_line_width(0.3)
+            pdf.rect(map_x, map_y, map_width, map_height)
+            
+            # 📸 INSERIR MAPA: Proporção matemática 1.615:1 (210mm / 130mm = 1.615)
+            # Sincronizado com viewport 1615x1000 do Playwright - ELIMINA DISTORÇÃO
+            if os.path.exists(screenshot_path):
+                pdf.image(screenshot_path, x=10, y=35, w=210, h=130)
+                logger.info(f"✓ Imagem do mapa inserida: {screenshot_path}")
+                logger.info(f"✓ Dimensões PDF: 210x130mm (proporção 1.615:1)")
+            else:
+                logger.warning(f"⚠ Screenshot não encontrado: {screenshot_path}")
+            
+            # --- ESCALA GRÁFICA (canto inferior esquerdo do mapa) ---
+            scale_x = map_x + 5
+            scale_y = map_y + map_height - 10
+            scale_width = 40
+            scale_height = 6
+            
+            # 🐧 LINUX FIX: Fundo branco sólido (sem alpha/transparência)
+            pdf.set_fill_color(245, 245, 245)  # Cinza claro
+            pdf.set_draw_color(100, 100, 100)  # Borda cinza
+            pdf.set_line_width(0.2)
+            pdf.rect(scale_x - 1, scale_y - 1, scale_width + 2, scale_height + 2, 'FD')
+            
+            # Barra da escala (preto e branco alternados)
+            pdf.set_fill_color(0, 0, 0)
+            pdf.set_draw_color(0, 0, 0)
+            pdf.rect(scale_x, scale_y, scale_width / 2, scale_height / 2, 'F')
+            pdf.set_fill_color(255, 255, 255)
+            pdf.rect(scale_x + scale_width / 2, scale_y, scale_width / 2, scale_height / 2, 'FD')
+            
+            # Texto da escala
+            pdf.set_font('Arial', 'B', 6)
+            pdf.set_text_color(0, 0, 0)
+            pdf.set_xy(scale_x, scale_y + scale_height / 2 + 0.5)
+            pdf.cell(scale_width, 3, metadata.get('scale', '1:50.000'), align='C')
+            
+            logger.info("✓ Moldura dupla e escala gráfica adicionadas")
+            
+            # --- CARIMBO TÉCNICO (lateral direita) ---
+            stamp_x = 225
+            stamp_y = 35
+            stamp_width = 62
+            
+            pdf.set_fill_color(240, 240, 240)
+            pdf.rect(stamp_x, stamp_y, stamp_width, 130, 'F')
+            
+            pdf.set_font('Arial', 'B', 10)
+            pdf.set_xy(stamp_x + 2, stamp_y + 5)
+            pdf.cell(stamp_width - 4, 6, 'DADOS TÉCNICOS', align='C')
+            
+            pdf.set_font('Arial', '', 8)
+            y_offset = stamp_y + 15
+            
+            # 🔒 METADADOS DO BANCO (com fallbacks seguros)
+            lat_center = metadata.get('lat_center')
+            lon_center = metadata.get('lon_center')
+            
+            pdf.set_xy(stamp_x + 2, y_offset)
+            pdf.cell(stamp_width - 4, 5, 'Coordenadas Centrais:', align='L')
+            y_offset += 5
+            
+            if lat_center is not None and lon_center is not None:
+                pdf.set_xy(stamp_x + 2, y_offset)
+                pdf.cell(stamp_width - 4, 4, f'Lat: {lat_center:.6f}', align='L')
+                y_offset += 4
+                pdf.set_xy(stamp_x + 2, y_offset)
+                pdf.cell(stamp_width - 4, 4, f'Lon: {lon_center:.6f}', align='L')
+            else:
+                pdf.set_xy(stamp_x + 2, y_offset)
+                pdf.cell(stamp_width - 4, 4, 'N/A', align='L')
+            
+            y_offset += 8
+            
+            # Total de marcadores (DO BANCO)
+            pdf.set_xy(stamp_x + 2, y_offset)
+            pdf.cell(stamp_width - 4, 5, f'Total de Pontos: {metadata.get("total_markers", 0)}', align='L')
+            y_offset += 8
+            
+            # Total de registros
+            pdf.set_xy(stamp_x + 2, y_offset)
+            pdf.cell(stamp_width - 4, 5, f'Registros: {metadata.get("total_records", 0)}', align='L')
+            y_offset += 8
+            
+            # Escala
+            pdf.set_xy(stamp_x + 2, y_offset)
+            pdf.cell(stamp_width - 4, 5, f'Escala: {metadata.get("scale", "1:50.000")}', align='L')
+            y_offset += 8
+            
+            # Período (se aplicável) - com tratamento de None
+            data_inicio = metadata.get('data_inicio', '')
+            data_fim = metadata.get('data_fim', '')
+            if data_inicio or data_fim:
+                pdf.set_xy(stamp_x + 2, y_offset)
+                pdf.cell(stamp_width - 4, 5, 'Período:', align='L')
+                y_offset += 5
+                
+                if data_inicio:
+                    pdf.set_xy(stamp_x + 2, y_offset)
+                    pdf.cell(stamp_width - 4, 4, f'De: {data_inicio}', align='L')
+                    y_offset += 4
+                
+                if data_fim:
+                    pdf.set_xy(stamp_x + 2, y_offset)
+                    pdf.cell(stamp_width - 4, 4, f'Até: {data_fim}', align='L')
+                    y_offset += 4
+            
+            y_offset += 5
+            
+            # Responsável técnico (com fallback)
+            pdf.set_xy(stamp_x + 2, y_offset)
+            pdf.set_font('Arial', 'B', 7)
+            pdf.cell(stamp_width - 4, 4, 'Responsável:', align='L')
+            y_offset += 4
+            pdf.set_font('Arial', '', 7)
+            pdf.set_xy(stamp_x + 2, y_offset)
+            pdf.multi_cell(stamp_width - 4, 3, metadata.get('responsible', 'N/A'))
+            
+            # --- RODAPÉ ---
+            pdf.set_fill_color(52, 73, 94)
+            pdf.rect(0, 185, 297, 25, 'F')
+            
+            pdf.set_text_color(255, 255, 255)
+            pdf.set_font('Arial', 'I', 8)
+            pdf.set_xy(10, 193)
+            pdf.cell(
+                0, 5,
+                'Documento gerado automaticamente | Dados extraídos do banco de dados',
+                align='C'
+            )
+            
+            # Salvar PDF (usando pathlib)
+            output_path = self.output_dir / output_filename
+            pdf.output(str(output_path))
+            
+            logger.info(f"✓ PDF gerado com sucesso: {output_path}")
+            logger.info(f"✓ Tamanho do arquivo: {output_path.stat().st_size / 1024:.1f} KB")
+            return str(output_path)
+            
+        except Exception as e:
+            error_trace = traceback.format_exc()
+            logger.error("=" * 80)
+            logger.error("🚨 ERRO NA GERAÇÃO DO PDF (Linux/FPDF2)")
+            logger.error(f"Tipo: {type(e).__name__}")
+            logger.error(f"Mensagem: {str(e)}")
+            logger.error(f"Traceback:\n{error_trace}")
+            logger.error("=" * 80)
+            raise Exception(f"Erro na geração do PDF (Linux): {str(e)}") from e
+    
+    async def generate_map_pdf(
+        self,
+        map_url: str,
+        output_filename: str,
+        metadata: Dict[str, Any]
+    ) -> str:
+        """
+        Método principal ASYNC: captura screenshot e gera PDF completo.
+        
+        FLUXO:
+        1. Captura screenshot (async via Playwright)
+        2. Salva temporário
+        3. Gera PDF (sync via run_in_executor)
+        4. Limpa temporários
+        
+        Args:
+            map_url: URL do mapa HTML a ser capturado
+            output_filename: Nome do arquivo PDF final
+            metadata: Metadados REAIS do BD
+            
+        Returns:
+            str: Caminho completo do PDF gerado
+        """
+        screenshot_path = None
+        
+        try:
+            # 🐛 DEBUG: Total de pontos sendo processados
+            total_markers = metadata.get('total_markers', 0)
+            print(f"\n🔍 DEBUG: Gerando mapa para {total_markers} pontos.\n")
+            
+            print("\n" + "📄" * 40)
+            print("📄 INICIANDO GERAÇÃO DE PDF COMPLETO")
+            print("📄" * 40)
+            print(f"\n📊 Metadados:")
+            print(f"   - Total de pontos: {total_markers}")
+            print(f"   - Total de registros: {metadata.get('total_records', 0)}")
+            print(f"   - Centro: ({metadata.get('lat_center')}, {metadata.get('lon_center')})")
+            print(f"   - Arquivo de saída: {output_filename}")
+            print(f"\n🔗 URL do mapa que será capturada:")
+            print(f"   {map_url}\n")
+            print("📄" * 40 + "\n")
+            
+            logger.info(f"Iniciando geração de PDF: {metadata.get('total_markers', 0)} pontos")
+            logger.info(f"URL do mapa: {map_url}")
+            logger.info(f"Arquivo de saída: {output_filename}")
+            
+            # PASSO 1: Capturar screenshot (ASYNC)
+            print("📸 PASSO 1/4: Capturando screenshot do mapa...\n")
+            screenshot_bytes = await self.capture_map_screenshot(map_url)
+            
+            # PASSO 2: Salvar screenshot temporário (I/O bound - ok em async)
+            print("\n💾 PASSO 2/4: Salvando screenshot temporário...")
+            screenshot_filename = f"temp_screenshot_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
+            screenshot_path = str(self.output_dir / screenshot_filename)
+            
+            with open(screenshot_path, 'wb') as f:
+                f.write(screenshot_bytes)
+            
+            print(f"✓ Screenshot salvo em: {screenshot_path}\n")
+            logger.info(f"Screenshot salvo temporariamente: {screenshot_path}")
+            
+            # PASSO 3: Gerar PDF (SYNC via executor para não bloquear)
+            print("📝 PASSO 3/4: Gerando PDF com FPDF2 (via executor)...")
+            logger.info("Executando _generate_pdf_sync via ThreadPoolExecutor...")
+            
+            # 🔧 PYTHON 3.12+: Usar asyncio.get_running_loop() ao invés de get_event_loop()
+            # Mais seguro e recomendado para código assíncrono moderno
+            loop = asyncio.get_running_loop()
+            pdf_path = await loop.run_in_executor(
+                self.executor,
+                self._generate_pdf_sync,
+                screenshot_path,
+                output_filename,
+                metadata
+            )
+            
+            print(f"✓ PDF gerado: {pdf_path}\n")
+            logger.info(f"PDF completo gerado: {pdf_path}")
+            
+            print("✅ PDF GERADO COM SUCESSO\n")
+            return pdf_path
+            
+        except Exception as e:
+            error_trace = traceback.format_exc()
+            
+            logger.error("=" * 80)
+            logger.error("🚨 ERRO NO FLUXO DE GERAÇÃO DE PDF (Linux)")
+            logger.error(f"Tipo: {type(e).__name__}")
+            logger.error(f"Mensagem: {str(e)}")
+            logger.error(f"Traceback completo:\n{error_trace}")
+            logger.error("=" * 80)
+            
+            # Re-raise com mensagem descritiva para Linux
+            raise Exception(f"Erro na geração do PDF (Linux/Playwright): {repr(e)}") from e
+            
+        finally:
+            # 🧹 CLEANUP: Remover screenshot temporário (usando pathlib)
+            if screenshot_path:
+                screenshot_file = Path(screenshot_path)
+                if screenshot_file.exists():
+                    try:
+                        screenshot_file.unlink()
+                        logger.debug(f"✓ Screenshot temporário removido: {screenshot_path}")
+                    except Exception as cleanup_err:
+                        logger.warning(f"⚠️  Não foi possível remover temporário: {cleanup_err}")
+    
+    def __del__(self):
+        """Cleanup do executor ao destruir o serviço."""
+        if hasattr(self, 'executor'):
+            self.executor.shutdown(wait=False)
